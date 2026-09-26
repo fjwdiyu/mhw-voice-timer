@@ -1,0 +1,23 @@
+{
+  "interval_seconds": 60,
+  "precision": 1,
+  "announce_start": true,
+  "announce_abandon": false,
+  "reset_on_load": true,
+  "completion_offset_seconds": 0.40,
+  "tts": {
+    "engine": "edge",
+    "edge_voice": "zh-CN-XiaoxiaoNeural",
+    "edge_rate": "+0%",
+    "edge_pitch": "+0Hz",
+    "sapi_voice": "Microsoft Huihui Desktop",
+    "sapi_rate": 0
+  },
+  "texts": {
+    "start": "任务开始",
+    "elapsed": "已进行 {time}",
+    "complete_head": "任务完成",
+    "complete_time": "用时 {time}",
+    "abandon": "任务结束"
+  }
+}
