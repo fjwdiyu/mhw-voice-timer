@@ -5,6 +5,8 @@
   "announce_abandon": false,
   "reset_on_load": true,
   "completion_offset_seconds": 0.40,
+  "reset_hotkey": "F11",
+  "auto_reset_seconds": 0,
   "tts": {
     "engine": "edge",
     "edge_voice": "zh-CN-XiaoxiaoNeural",
@@ -18,6 +20,7 @@
     "elapsed": "已进行 {time}",
     "complete_head": "任务完成",
     "complete_time": "用时 {time}",
-    "abandon": "任务结束"
+    "abandon": "任务结束",
+    "auto_reset": "超时，自动重置"
   }
 }

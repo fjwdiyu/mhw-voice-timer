@@ -67,6 +67,8 @@ DEFAULT_CONFIG = {
     "announce_abandon": False,   # 中途放弃/失败时是否播报
     "reset_on_load": True,       # 任务中读条结束即视为“新的一局”（IN-Q 快速重置依赖此开关；多区任务换区也会读条，可设为 false）
     "completion_offset_seconds": 0.40,  # 完成时间补偿：目标完成到游戏计时器冻结之间的秒数，用于对齐结算画面时间
+    "reset_hotkey": "F11",       # 触发 IN-Q 重置的按键（F10/F11/...）
+    "auto_reset_seconds": 0,     # 定时重置：任务进行到该秒数自动触发重置（0=关闭）
     "tts": {
         "engine": "edge",                          # edge = 晓晓神经网络音(甜美少女,需联网) | sapi = Windows内置
         "edge_voice": "zh-CN-XiaoxiaoNeural",      # 也可试 zh-CN-XiaoyiNeural(小伊,活泼)
@@ -81,6 +83,7 @@ DEFAULT_CONFIG = {
         "complete_head": "任务完成",
         "complete_time": "用时 {time}",
         "abandon": "任务结束",
+        "auto_reset": "超时，自动重置",
     },
 }
 
@@ -227,6 +230,43 @@ def read_u64(hproc, addr):
 def read_f32(hproc, addr):
     d = read_bytes(hproc, addr, 4)
     return None if (d is None or len(d) < 4) else struct.unpack("<f", d[:4])[0]
+
+
+# ---------------- 触发按键（用于触发 IN-Q 重置） ----------------
+
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+user32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_void_p]
+user32.keybd_event.restype = None
+KEYEVENTF_KEYUP = 0x0002
+
+VK_CODES = {}
+for _i in range(1, 13):
+    VK_CODES["F%d" % _i] = 0x6F + _i   # F1=0x70 ... F12=0x7B
+VK_CODES.update({"SPACE": 0x20, "ENTER": 0x0D, "TAB": 0x09, "ESC": 0x1B,
+                 "INSERT": 0x2D, "DELETE": 0x2E, "HOME": 0x24, "END": 0x23,
+                 "NUM0": 0x60, "NUM1": 0x61, "NUM2": 0x62, "NUM3": 0x63})
+
+
+def send_key(vk, hold=0.04):
+    """向系统注入一次按键（IN-Q 用的低级键盘钩子能收到合成按键）。"""
+    user32.keybd_event(vk, 0, 0, None)
+    time.sleep(hold)
+    user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, None)
+
+
+def send_reset_key(cfg):
+    """按配置的快捷键触发 IN-Q 重置；成功返回 True。"""
+    name = str(cfg.get("reset_hotkey", "F11") or "F11").upper()
+    vk = VK_CODES.get(name)
+    if vk is None:
+        print("[重置] 未知按键：%s" % name, flush=True)
+        return False
+    try:
+        send_key(vk)
+        return True
+    except Exception as e:
+        print("[重置] 发送按键失败：%s" % e, flush=True)
+        return False
 
 
 # ---------------- 特征码扫描 ----------------
@@ -527,7 +567,7 @@ def _wait(sec, stop_event):
     return stop_event.wait(sec)
 
 
-def run_timer(cfg, stop_event=None):
+def run_timer(cfg, stop_event=None, status=None):
     speak_q, pregen_q = start_tts(cfg.get("tts", {}))
     interval = max(1, int(cfg.get("interval_seconds", 60)))
     precision = max(0, min(3, int(cfg.get("precision", 1))))
@@ -537,6 +577,14 @@ def run_timer(cfg, stop_event=None):
         completion_offset = max(0.0, float(cfg.get("completion_offset_seconds", 0.45)))
     except (TypeError, ValueError):
         completion_offset = 0.45
+    try:
+        auto_reset_seconds = max(0.0, float(cfg.get("auto_reset_seconds", 0) or 0))
+    except (TypeError, ValueError):
+        auto_reset_seconds = 0.0
+
+    def set_status(**kw):
+        if status is not None:
+            status.update(kw)
 
     # 预生成固定/首条文案，播放零生成延迟
     pregen_q.put((texts.get("start", "任务开始"), False))
@@ -565,7 +613,11 @@ def run_timer(cfg, stop_event=None):
     out_streak = 0
     read_fail_streak = 0
     last_field_resolve = 0.0
+    auto_reset_done = False
 
+    set_status(connected=False, resolved=False, in_quest=False, quest_id=0,
+               elapsed=0.0, completed=False, auto_reset_seconds=auto_reset_seconds,
+               auto_reset_triggered=False, last_event="启动中")
     print("MHW 竞速语音计时器已启动，等待游戏 %s ..." % PROCESS_NAME, flush=True)
 
     try:
@@ -580,12 +632,15 @@ def run_timer(cfg, stop_event=None):
                     in_quest = completed = completing = False
                     ticking = False
                     accumulated = 0.0
+                    auto_reset_done = False
+                    set_status(connected=False, resolved=False, in_quest=False, elapsed=0.0, last_event="等待游戏")
                     if _wait(2, stop_event):
                         break
                     continue
                 hproc = open_process(pid)
                 base, size = get_module(pid)
                 bases, fields = {}, {}
+                set_status(connected=True, pid=pid, resolved=False, last_event="已连接游戏")
                 print("已附加到 %s (PID %d)" % (PROCESS_NAME, pid), flush=True)
 
             if not fields:
@@ -607,6 +662,7 @@ def run_timer(cfg, stop_event=None):
                 ok = [f for f, a in fields.items() if a]
                 print("特征码定位完成，字段解析 %d/%d。" % (len(ok), len(FIELDS)), flush=True)
                 last_field_resolve = time.perf_counter()
+                set_status(resolved=True, last_event="特征码定位完成")
 
             qid = read_i32(hproc, fields["quest_id"]) if fields.get("quest_id") else None
             obj = read_u8(hproc, fields["obj1_state"]) if fields.get("obj1_state") else None
@@ -645,6 +701,9 @@ def run_timer(cfg, stop_event=None):
                     accumulated = 0.0
                     ticking = False
                     last_interval_n = 0
+                    auto_reset_done = False
+                    set_status(in_quest=True, quest_id=qid, completed=False,
+                               auto_reset_triggered=False, last_event="检测到任务 ID=%d" % qid)
                     print("检测到任务（ID=%d）" % qid, flush=True)
 
                 # 读条结束 → 新的一局（初次进图 / IN-Q 快速重置）
@@ -660,6 +719,9 @@ def run_timer(cfg, stop_event=None):
                         accumulated = 0.0
                         ticking = False
                         last_interval_n = 0
+                        auto_reset_done = False
+                        set_status(in_quest=True, quest_id=qid, completed=False, elapsed=0.0,
+                                   auto_reset_triggered=False, last_event="任务（重新）开始")
                         if cfg.get("announce_start", True):
                             speak_q.put(texts.get("start", "任务开始"))
                             print("[语音] %s" % texts.get("start", "任务开始"), flush=True)
@@ -677,6 +739,8 @@ def run_timer(cfg, stop_event=None):
                     accumulated = 0.0
                     loaded_once = False
                     last_interval_n = 0
+                    auto_reset_done = False
+                    set_status(in_quest=False, completed=False, elapsed=0.0, last_event="任务已结束")
                     print("任务已结束。", flush=True)
 
             # 秒表：任务中且非读条且未完成时走表
@@ -705,6 +769,8 @@ def run_timer(cfg, stop_event=None):
                 speak_q.put(head)              # 缓存命中 → 立即播“任务完成”
                 pregen_q.put((time_msg, True))  # 后台生成“用时 X”，生成完自动播
                 print("[语音] %s %s" % (head, time_msg), flush=True)
+                set_status(completed=True, elapsed=elapsed,
+                           last_event="任务完成 %.1f 秒" % elapsed)
 
             # 间隔播报（整点播报，并预生成下一条）
             if should_tick and not completed and not completing:
@@ -718,6 +784,26 @@ def run_timer(cfg, stop_event=None):
                     nxt = texts.get("elapsed", "已进行 {time}").format(time=format_time((n + 1) * interval, precision))
                     pregen_q.put((nxt, False))  # 预生成下一条，到点零延迟
                     print("[语音] %s" % msg, flush=True)
+
+            # 定时重置：任务进行到设定秒数，自动触发 IN-Q 重置
+            if (auto_reset_seconds > 0 and should_tick and not completed and not completing
+                    and not auto_reset_done):
+                elapsed = accumulated + (now - tick_start if ticking else 0.0)
+                if elapsed >= auto_reset_seconds:
+                    auto_reset_done = True
+                    if send_reset_key(cfg):
+                        print("[重置] 已到 %.1f 秒，自动触发重置" % auto_reset_seconds, flush=True)
+                        speak_q.put(texts.get("auto_reset", "超时，自动重置"))
+                        set_status(auto_reset_triggered=True,
+                                   last_event="已自动重置（%.0f 秒）" % auto_reset_seconds)
+
+            # 更新状态供 UI 读取
+            if status is not None:
+                status["elapsed"] = accumulated + (now - tick_start if ticking else 0.0)
+                status["in_quest"] = in_quest
+                status["quest_id"] = qid
+                status["completed"] = completed
+                status["loading"] = loading
 
             prev_qid = qid
             prev_obj = obj
@@ -792,7 +878,8 @@ def parse_args():
     ap.add_argument("--config", default=None, help="配置文件路径（默认同目录 config.json）")
     ap.add_argument("--diagnose", action="store_true", help="诊断模式")
     ap.add_argument("--test-tts", metavar="文字", default=None, help="测试语音引擎并退出")
-    ap.add_argument("--console", action="store_true", help="强制控制台模式（不驻留托盘）")
+    ap.add_argument("--console", action="store_true", help="强制控制台模式（无界面）")
+    ap.add_argument("--tray", action="store_true", help="托盘模式（无图形界面）")
     return ap.parse_args()
 
 
@@ -871,7 +958,26 @@ def main():
         diagnose(cfg)
         return
 
-    if _HAS_TRAY and not args.console:
+    if args.console:
+        run_timer(cfg, None)
+        return
+
+    if args.tray:
+        if _HAS_TRAY:
+            run_tray(cfg)
+        else:
+            run_timer(cfg, None)
+        return
+
+    # 默认：图形界面；失败则回退托盘/命令行
+    try:
+        from mhw_ui import run_ui
+        run_ui(cfg, cfg_path)
+        return
+    except Exception as e:
+        print("[UI] 图形界面启动失败，回退无界面模式：%s" % e, flush=True)
+
+    if _HAS_TRAY:
         run_tray(cfg)
     else:
         run_timer(cfg, None)
